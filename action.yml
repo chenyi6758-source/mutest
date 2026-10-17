@@ -33,10 +33,18 @@ inputs:
     description: "Per-mutant pytest timeout in seconds"
     required: false
     default: "120"
+  fail-under:
+    description: "Minimum final mutation score in percentage points (0-100); timeout/error outcomes also fail when set"
+    required: false
+    default: ""
   incremental:
-    description: "Only mutate files changed vs git HEAD (set to 'true' for PR runs)"
+    description: "Only mutate changed files (set to 'true' for PR runs; use base-ref for committed PR diffs)"
     required: false
     default: "false"
+  base-ref:
+    description: "Base git revision for incremental PR runs (diffed as base...HEAD)"
+    required: false
+    default: ""
   report-path:
     description: "Where to write the HTML report"
     required: false
@@ -59,23 +67,58 @@ runs:
         python-version: "3.12"
     - name: Install mutest
       shell: bash
-      run: pip install "mutest @ git+https://github.com/chenyi6758-source/mutest@v0.1.0"
+      env:
+        MUTEST_ACTION_SHA: ${{ github.action_sha }}
+      run: pip install "mutest[ai] @ git+https://github.com/chenyi6758-source/mutest@${MUTEST_ACTION_SHA}"
     - name: Run mutest
       id: run
       shell: bash
       env:
         OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
         ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
+        MUTEST_SRC: ${{ inputs.src }}
+        MUTEST_TESTS: ${{ inputs.tests }}
+        MUTEST_MODEL: ${{ inputs.model }}
+        MUTEST_VERIFY_MODEL: ${{ inputs.verify-model }}
+        MUTEST_TOP_N: ${{ inputs.top-n }}
+        MUTEST_WORKERS: ${{ inputs.workers }}
+        MUTEST_TIMEOUT: ${{ inputs.timeout }}
+        MUTEST_FAIL_UNDER: ${{ inputs.fail-under }}
+        MUTEST_INCREMENTAL: ${{ inputs.incremental }}
+        MUTEST_BASE_REF: ${{ inputs.base-ref }}
+        MUTEST_REPORT_PATH: ${{ inputs.report-path }}
       run: |
-        ARGS="--src '${{ inputs.src }}' --tests '${{ inputs.tests }}' --top-n '${{ inputs.top-n }}' --workers '${{ inputs.workers }}' --timeout '${{ inputs.timeout }}' --output '${{ inputs.report-path }}' --json"
-        if [ -n "${{ inputs.model }}" ]; then ARGS="$ARGS --model '${{ inputs.model }}'"; fi
-        if [ -n "${{ inputs.verify-model }}" ]; then ARGS="$ARGS --verify-model '${{ inputs.verify-model }}'"; fi
-        if [ "${{ inputs.incremental }}" = "true" ]; then ARGS="$ARGS --incremental"; fi
-        OUT=$(mutest $ARGS | tail -1)
-        echo "score=$OUT" >> "$GITHUB_OUTPUT"
-        echo "$OUT"
+        set -euo pipefail
+        args=(
+          --src "$MUTEST_SRC"
+          --tests "$MUTEST_TESTS"
+          --top-n "$MUTEST_TOP_N"
+          --workers "$MUTEST_WORKERS"
+          --timeout "$MUTEST_TIMEOUT"
+          --output "$MUTEST_REPORT_PATH"
+          --json
+        )
+        if [[ -n "$MUTEST_FAIL_UNDER" ]]; then args+=(--fail-under "$MUTEST_FAIL_UNDER"); fi
+        if [[ -n "$MUTEST_MODEL" ]]; then args+=(--model "$MUTEST_MODEL"); fi
+        if [[ -n "$MUTEST_VERIFY_MODEL" ]]; then args+=(--verify-model "$MUTEST_VERIFY_MODEL"); fi
+        if [[ "$MUTEST_INCREMENTAL" == "true" ]]; then
+          args+=(--incremental)
+          if [[ -n "$MUTEST_BASE_REF" ]]; then args+=(--base-ref "$MUTEST_BASE_REF"); fi
+        fi
+        set +e
+        output="$(mutest "${args[@]}")"
+        status=$?
+        set -e
+        score="${output##*$'\n'}"
+        printf '%s\n' "$output"
+        if [[ "$score" == \{* ]]; then
+          printf 'score=%s\n' "$score" >> "$GITHUB_OUTPUT"
+        fi
+        exit "$status"
     - name: Upload HTML report
+      if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
         name: mutest-report
         path: ${{ inputs.report-path }}
+        if-no-files-found: ignore

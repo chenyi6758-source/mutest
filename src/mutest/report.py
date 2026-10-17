@@ -60,8 +60,8 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
     <div class="card"><div class="v">{{ total }}</div><div class="l">mutants</div></div>
     <div class="card"><div class="v green">{{ killed }}</div><div class="l">killed</div></div>
     <div class="card"><div class="v red">{{ survived }}</div><div class="l">survived</div></div>
-    {% if timeout %}<div class="card"><div class="v yellow">{{ timeout }}</div><div class="l">timeout (counted killed)</div></div>{% endif %}
-    {% if error %}<div class="card"><div class="v">{{ error }}</div><div class="l">errors (excluded)</div></div>{% endif %}
+    {% if timeout %}<div class="card"><div class="v yellow">{{ timeout }}</div><div class="l">timeout (not killed)</div></div>{% endif %}
+    {% if error %}<div class="card"><div class="v red">{{ error }}</div><div class="l">errors (not killed)</div></div>{% endif %}
     <div class="card"><div class="v">{{ elapsed_s }}s</div><div class="l">runtime</div></div>
   </div>
 
@@ -78,10 +78,11 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
 
   <h2>Per-file breakdown</h2>
   <table>
-    <tr><th>file</th><th>mutants</th><th>killed</th><th>survived</th><th>score</th></tr>
+    <tr><th>file</th><th>mutants</th><th>killed</th><th>survived</th><th>timeout</th><th>errors</th><th>score</th></tr>
     {% for f in files %}
     <tr><td><code>{{ f.name }}</code></td><td>{{ f.total }}</td>
         <td class="green">{{ f.killed }}</td><td class="red">{{ f.survived }}</td>
+        <td class="yellow">{{ f.timeout }}</td><td class="red">{{ f.error }}</td>
         <td>{{ (f.score*100)|round(1) }}%</td></tr>
     {% endfor %}
   </table>
@@ -97,15 +98,36 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
     </div>
   </details>
   {% endfor %}
+  {% elif unresolved_mutants %}
+  <h2>⚠️ No survived mutants, but {{ unresolved_mutants|length }} mutant(s) were not completed.</h2>
+  {% elif timeout or error %}
+  <h2>⚠️ No survived mutants, but {{ timeout + error }} mutant(s) were not completed.</h2>
   {% else %}
-  <h2>🎉 No survived mutants — every mutation was caught.</h2>
+   <h2>🎉 No survived mutants — every mutation was caught.</h2>
+   {% endif %}
+
+  {% if unresolved_mutants %}
+  <h2>⚠️ Mutants not killed because execution did not complete</h2>
+  {% for m in unresolved_mutants %}
+  <details>
+    <summary><code>{{ m.id }}</code>
+       <span class="badge {{ 'b-yellow' if m.status == 'timeout' else 'b-red' }}">{{ m.status }}</span>
+      <span>{{ m.description }}</span></summary>
+    <div class="diff">
+      <div><div class="h">original</div><pre>{{ m.original_snippet }}</pre></div>
+      <div><div class="h">mutated</div><pre>{{ m.mutated_snippet }}</pre></div>
+    </div>
+    {% if m.detail %}<pre>{{ m.detail }}</pre>{% endif %}
+  </details>
+  {% endfor %}
   {% endif %}
 
   {% if generated_tests %}
   <h2>🤖 AI-generated tests</h2>
   {% for t in generated_tests %}
   <div class="gen">
-    <strong><code>{{ t.name }}</code></strong> <span class="badge b-green">{{ t.status }}</span>
+    <strong><code>{{ t.name }}</code></strong>
+    <span class="badge {{ 'b-green' if t.status == 'killed ✓' else 'b-yellow' if t.status in ('timeout', 'error') else 'b-red' }}">{{ t.status }}</span>
     <span class="sub">target: <code>{{ t.target }}</code> · model: <code>{{ t.model }}</code></span>
     <pre>{{ t.code }}</pre>
   </div>
@@ -121,12 +143,12 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
 
 
 def render_report(context: dict) -> str:
-    from jinja2 import Template
+    from jinja2 import Environment
 
     ctx = dict(context)
     ctx.setdefault("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     ctx.setdefault("delta", None)
-    return Template(REPORT_TEMPLATE).render(**ctx)
+    return Environment(autoescape=True).from_string(REPORT_TEMPLATE).render(**ctx)
 
 
 def write_report(path: str, context: dict) -> str:

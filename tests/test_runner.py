@@ -6,11 +6,17 @@ import pytest
 
 from mutest.mutators import generate_mutants
 from mutest.runner import (
+    AUTO_WORKER_LIMIT,
     KILLED,
     SURVIVED,
     BaselineError,
+    RunSummary,
+    _Worker,
+    _automatic_worker_count,
+    _effective_worker_count,
     check_baseline,
     run_mutants,
+    sanitize_environment,
 )
 
 SAMPLE = Path(__file__).resolve().parent.parent / "examples" / "sample_calc"
@@ -30,6 +36,44 @@ def test_baseline_red_raises(tmp_path):
     (tests / "test_m.py").write_text("def test_f():\n    assert False\n")
     with pytest.raises(BaselineError):
         check_baseline(src, tests, timeout=60)
+
+
+def test_sibling_project_context_preserves_root_fixture_without_copying_repo(tmp_path):
+    project = tmp_path / "project"
+    src = project / "src"
+    tests = project / "tests"
+    src.mkdir(parents=True)
+    tests.mkdir()
+    (project / "conftest.py").write_text(
+        "import pytest\n\n"
+        "@pytest.fixture\n"
+        "def project_marker():\n"
+        "    return 'from root conftest'\n"
+    )
+    (project / "pytest.ini").write_text("[pytest]\ntestpaths = tests\n")
+    (project / ".env").write_text("SHOULD_NOT_BE_COPIED=secret\n")
+    (src / "module.py").write_text("def value():\n    return 1\n")
+    (tests / "test_context.py").write_text(
+        "def test_root_fixture(project_marker):\n"
+        "    assert project_marker == 'from root conftest'\n"
+    )
+
+    worker = _Worker(src, tests)
+    try:
+        assert (worker.root / "conftest.py").exists()
+        assert (worker.root / "pytest.ini").exists()
+        assert not (worker.root / ".env").exists()
+        rc, out = worker.run_pytest(timeout=60)
+    finally:
+        worker.close()
+    assert rc == 0, out
+    assert "1 passed" in out
+
+
+def test_automatic_worker_count_is_bounded_but_explicit_values_are_not(monkeypatch):
+    monkeypatch.setattr("mutest.runner.os.cpu_count", lambda: 128)
+    assert _automatic_worker_count() == AUTO_WORKER_LIMIT
+    assert _effective_worker_count(12) == 12
 
 
 def _mutants_by_desc():
@@ -62,6 +106,45 @@ def test_summary_score_math():
     assert summary.killed == 1
     assert summary.survived == 1
     assert summary.score == 0.5
+
+
+def test_summary_score_counts_timeout_and_error_in_denominator():
+    summary = RunSummary(total=4, killed=1, survived=1, timeout=1, error=1)
+    assert summary.score == 0.25
+    assert summary.as_dict()["score"] == 0.25
+
+
+def test_secret_like_environment_is_removed_for_test_subprocesses():
+    env = sanitize_environment({
+        "OPENAI_API_KEY": "secret",
+        "GITHUB_TOKEN": "token",
+        "DATABASE_PASSWORD": "password",
+        "SERVICE_KEY": "key",
+        "SAFE_SETTING": "kept",
+    })
+    assert env == {"SAFE_SETTING": "kept"}
+
+
+def test_worker_passes_sanitized_environment_to_pytest(monkeypatch):
+    from mutest.runner import _Worker
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs["env"])
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("SAFE_SETTING", "kept")
+    monkeypatch.setattr("mutest.runner.subprocess.run", fake_run)
+    worker = _Worker(SAMPLE, SAMPLE)
+    try:
+        rc, _ = worker.run_pytest(timeout=1, sanitize_env=True)
+    finally:
+        worker.close()
+    assert rc == 0
+    assert "OPENAI_API_KEY" not in captured
+    assert captured["SAFE_SETTING"] == "kept"
 
 
 def test_parallel_results_deterministic():

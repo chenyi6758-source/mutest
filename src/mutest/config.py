@@ -5,7 +5,7 @@ Example::
     operators:            # enable/disable operators (default: all on)
       AOR: true
       STR: false
-    workers: 4            # parallel mutant executions (default: cpu_count - 1)
+    workers: 4            # parallel mutant executions (auto is capped at 8)
     timeout: 120          # per-mutant pytest timeout in seconds
     model: gpt-4o-mini    # default LLM for test generation
     verify_model: claude-haiku-4-5  # optional cross-model judge

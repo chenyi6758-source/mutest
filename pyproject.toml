@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,14 +7,13 @@ name = "mutest"
 version = "0.1.0"
 description = "Mutation-testing-driven AI test generation loop — the MIT successor to qodo-cover"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Chen Yi", email = "chenyi6758@gmail.com" }]
 keywords = ["mutation-testing", "testing", "ai", "pytest", "code-quality"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -22,12 +21,12 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 dependencies = [
-    "litellm>=1.0",
     "jinja2>=3.0",
     "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
+ai = ["litellm>=1.0"]
 dev = ["pytest>=8.0", "pytest-xdist>=3.0"]
 
 [project.urls]

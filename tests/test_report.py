@@ -9,9 +9,9 @@ def _ctx():
         "version": "0.1.0",
         "score": 0.75,
         "total": 4, "killed": 3, "survived": 1,
-        "timeout": 0, "error": 0, "elapsed_s": 12.3,
+        "timeout": 1, "error": 1, "elapsed_s": 12.3,
         "files": [{"name": "calc.py", "total": 4, "killed": 3,
-                   "survived": 1, "score": 0.75}],
+                   "survived": 0, "timeout": 1, "error": 0, "score": 0.75}],
         "survived_mutants": [{
             "id": "calc.py:14:ROR:1", "operator": "ROR",
             "description": ">= -> >",
@@ -32,6 +32,24 @@ def test_report_renders(tmp_path):
     assert "&gt;=" in html or ">=" in html  # snippet present (escaped or not)
     assert "test_mutest_boundary" in html
     assert "mutest 0.1.0" in html
+    assert "timeout (not killed)" in html
+    assert "errors (not killed)" in html
+
+
+def test_report_escapes_untrusted_values_and_shows_unresolved_statuses():
+    ctx = _ctx()
+    ctx["target"] = "<script>alert('target')</script>"
+    ctx["unresolved_mutants"] = [{
+        "id": "m.py:1:ERR:1", "operator": "ERR",
+        "description": "<script>alert('description')</script>",
+        "original_snippet": "return '<script>'",
+        "mutated_snippet": "return '<script>mutated</script>'",
+        "status": "timeout", "detail": "pytest timed out <now>",
+    }]
+    html = render_report(ctx)
+    assert "<script>alert" not in html
+    assert "&lt;script&gt;" in html
+    assert "timeout" in html
 
 
 def test_report_no_survivors_message():
@@ -39,6 +57,8 @@ def test_report_no_survivors_message():
     ctx["survived"] = 0
     ctx["survived_mutants"] = []
     ctx["killed"] = 4
+    ctx["timeout"] = 0
+    ctx["error"] = 0
     ctx["score"] = 1.0
     html = render_report(ctx)
     assert "No survived mutants" in html

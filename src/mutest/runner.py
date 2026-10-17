@@ -1,14 +1,16 @@
 """Execute the test suite against each mutant, in parallel.
 
 Design: one temp workspace per worker thread (a pristine copy of the source
-and test trees). For each mutant the worker overwrites the single mutated
-file, runs ``python -m pytest`` with ``-x`` (stop at first failure — we only
-need to know whether the suite detects the change), then restores the file.
+and test trees plus allowlisted root-level pytest context). For each mutant
+the worker overwrites the single mutated file, runs ``python -m pytest`` with
+``-x`` (stop at first failure — we only need to know whether the suite detects
+the change), then restores the file.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +27,11 @@ KILLED = "killed"
 SURVIVED = "survived"
 TIMEOUT = "timeout"
 ERROR = "error"
+
+# A large machine should not create one Python process per CPU by default.
+# Positive --workers values are passed through unchanged; this only limits the
+# automatic value selected when workers is zero or negative.
+AUTO_WORKER_LIMIT = 8
 
 
 @dataclass
@@ -46,11 +53,15 @@ class RunSummary:
 
     @property
     def score(self) -> float:
-        """Mutation score = killed / total (errors excluded, timeouts count as killed)."""
-        denom = self.total - self.error
-        if denom <= 0:
+        """Mutation score = killed / total.
+
+        A timeout or execution error means the mutant was not successfully
+        classified as killed, so both remain in the denominator and lower the
+        score rather than being counted as a success or silently excluded.
+        """
+        if self.total <= 0:
             return 0.0
-        return (self.killed + self.timeout) / denom
+        return self.killed / self.total
 
     def as_dict(self) -> dict:
         return {
@@ -66,6 +77,25 @@ class RunSummary:
 
 class BaselineError(RuntimeError):
     """Raised when the test suite fails on the unmutated code."""
+
+
+_SECRET_ENV_RE = re.compile(
+    r"(?:^|_)(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|AUTH|"
+    r"PRIVATE)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """Copy an environment without common secret-like variable names.
+
+    Mutant and generated-test subprocesses execute untrusted, model-produced
+    code.  They still receive normal process configuration, but provider keys,
+    tokens, passwords, and credential variables are deliberately withheld.
+    """
+    source = os.environ if environ is None else environ
+    return {key: value for key, value in source.items()
+            if not _SECRET_ENV_RE.search(key)}
 
 
 class _Worker:
@@ -86,6 +116,7 @@ class _Worker:
             self.tests = self.src
         else:
             shutil.copytree(tests_dir, self.tests, ignore=no_cache)
+        self._copy_project_context(src_dir, tests_dir)
         # remember pristine bytes of every file we may overwrite
         self._pristine: dict[str, bytes] = {}
         for base in {self.src, self.tests}:
@@ -97,6 +128,25 @@ class _Worker:
         # when src and tests are the same directory)
         self._tests_arg = self.tests.relative_to(self.root).as_posix()
 
+    def _copy_project_context(self, src_dir: Path, tests_dir: Path) -> None:
+        """Copy only root-level pytest context for sibling source/test trees.
+
+        A temporary workspace must not become a copy of the whole project:
+        that could include secrets, build outputs, or unrelated application
+        data.  These are the standard files pytest uses to discover project
+        fixtures and configuration, so copy only the explicit allowlist when
+        ``src`` and ``tests`` share a project root.
+        """
+        src_root = src_dir.resolve().parent
+        tests_root = tests_dir.resolve().parent
+        if src_root != tests_root:
+            return
+        for name in ("conftest.py", "pytest.ini", "pyproject.toml",
+                     "setup.cfg", "tox.ini"):
+            source = src_root / name
+            if source.is_file():
+                shutil.copy2(source, self.root / name)
+
     def _write_mutant(self, mutant: Mutant) -> None:
         target = self.src / mutant.file
         target.write_text(mutant.source, encoding="utf-8")
@@ -106,13 +156,19 @@ class _Worker:
         target.write_bytes(self._pristine[mutant.file])
 
     def run_pytest(self, timeout: int, extra_args: list[str] | None = None,
-                   target: str | None = None) -> tuple[int, str]:
-        """Run pytest in the workspace. Returns (returncode, output tail)."""
+                   target: str | None = None,
+                   sanitize_env: bool = False) -> tuple[int, str]:
+        """Run pytest in the workspace. Returns (returncode, output tail).
+
+        Secret filtering is opt-in so ordinary project tests retain their
+        existing environment.  Generated-test validation enables it because
+        that code came from an LLM.
+        """
         cmd = [sys.executable, "-m", "pytest", target or self._tests_arg,
                "-x", "-q", "-p", "no:cacheprovider"]
         if extra_args:
             cmd.extend(extra_args)
-        env = dict(os.environ)
+        env = sanitize_environment() if sanitize_env else dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(
             [str(self.src), str(self.tests), env.get("PYTHONPATH", "")]
         )
@@ -133,13 +189,14 @@ class _Worker:
                 out += e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else e.stdout
             return -1, out[-2000:]
 
-    def run_mutant(self, mutant: Mutant, timeout: int) -> MutantResult:
+    def run_mutant(self, mutant: Mutant, timeout: int,
+                   sanitize_env: bool = False) -> MutantResult:
         import time
 
         t0 = time.time()
         try:
             self._write_mutant(mutant)
-            rc, out = self.run_pytest(timeout)
+            rc, out = self.run_pytest(timeout, sanitize_env=sanitize_env)
         except Exception as e:  # workspace I/O problems etc.
             return MutantResult(mutant, ERROR, time.time() - t0, str(e)[:500])
         finally:
@@ -149,7 +206,7 @@ class _Worker:
                 pass
         dur = time.time() - t0
         if rc == -1:
-            # Timeout: the suite did not complete -> the change was detected.
+            # Timeout: the suite did not complete, so this is not a kill.
             return MutantResult(mutant, TIMEOUT, dur, "pytest timed out")
         if rc == 0:
             return MutantResult(mutant, SURVIVED, dur, "")
@@ -184,13 +241,13 @@ def run_mutants(
     workers: int = 0,
     timeout: int = 120,
     progress_cb=None,
+    sanitize_env: bool = False,
 ) -> tuple[list[MutantResult], RunSummary]:
     """Run every mutant; return per-mutant results and the aggregate summary."""
     import time
 
     t0 = time.time()
-    if workers <= 0:
-        workers = max(1, (os.cpu_count() or 2) - 1)
+    workers = _effective_worker_count(workers)
     results: list[MutantResult] = []
     # One workspace per OS thread, bound via thread-local storage.
     # (Task indices must NOT be used to pick a workspace: the pool hands
@@ -212,7 +269,7 @@ def run_mutants(
     try:
 
         def _one(mutant: Mutant) -> MutantResult:
-            r = _workspace().run_mutant(mutant, timeout)
+            r = _workspace().run_mutant(mutant, timeout, sanitize_env=sanitize_env)
             if progress_cb:
                 progress_cb(r)
             return r
@@ -235,3 +292,13 @@ def run_mutants(
         else:
             summary.error += 1
     return results, summary
+
+
+def _automatic_worker_count() -> int:
+    """Return the bounded worker count used when no explicit value is set."""
+    return min(max(1, (os.cpu_count() or 2) - 1), AUTO_WORKER_LIMIT)
+
+
+def _effective_worker_count(workers: int) -> int:
+    """Resolve automatic workers while preserving every explicit positive value."""
+    return workers if workers > 0 else _automatic_worker_count()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -25,6 +26,44 @@ from mutest.runner import (
 from mutest.report import write_report
 
 
+THRESHOLD_FAILURE = 4
+
+
+def _percentage(value: str) -> float:
+    """Parse a finite percentage-point value in the inclusive 0-100 range."""
+    try:
+        percentage = float(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be a number between 0 and 100") from e
+    if not math.isfinite(percentage) or not 0 <= percentage <= 100:
+        raise argparse.ArgumentTypeError("must be a number between 0 and 100")
+    return percentage
+
+
+def _threshold_failure_reasons(summary, fail_under: float | None) -> list[str]:
+    """Return CI failure reasons for an explicitly requested score threshold."""
+    if fail_under is None:
+        return []
+    reasons = []
+    score_percentage = summary.score * 100
+    if score_percentage < fail_under:
+        reasons.append(
+            f"mutation score {score_percentage:.1f}% is below --fail-under "
+            f"{fail_under:g}%"
+        )
+    incomplete = []
+    if summary.timeout:
+        incomplete.append(f"{summary.timeout} timeout(s)")
+    if summary.error:
+        incomplete.append(f"{summary.error} error(s)")
+    if incomplete:
+        reasons.append(
+            "mutation run has " + " and ".join(incomplete) +
+            "; thresholded runs require every mutant to complete"
+        )
+    return reasons
+
+
 def _is_test_file(path: Path) -> bool:
     name = path.name
     return (
@@ -42,11 +81,17 @@ def collect_sources(src_dir: Path) -> list[Path]:
     return files
 
 
-def changed_files_since_git(src_dir: Path) -> list[Path] | None:
-    """Files changed vs HEAD (incremental mode). Returns None if git fails."""
+def changed_files_since_git(src_dir: Path, base_ref: str | None = None) -> list[Path] | None:
+    """Files changed for incremental mode. Returns None if git fails.
+
+    Without an explicit base revision this preserves the local development
+    behavior of comparing the working tree with ``HEAD``.  CI pull requests
+    can pass a base revision to compare the committed range ``base...HEAD``.
+    """
+    revision = f"{base_ref}...HEAD" if base_ref else "HEAD"
     try:
         out = subprocess.run(
-            ["git", "-C", str(src_dir), "diff", "--name-only", "HEAD"],
+            ["git", "-C", str(src_dir), "diff", "--name-only", revision, "--"],
             capture_output=True, text=True, timeout=30,
         )
         if out.returncode != 0:
@@ -77,11 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-n", type=int, default=10,
                    help="survived mutants to target with AI tests (default: 10)")
     p.add_argument("--workers", type=int, default=0,
-                   help="parallel mutant runs (default: cpu_count - 1)")
+                   help="parallel mutant runs (default: cpu_count - 1, capped at 8; "
+                        "explicit values are honored)")
     p.add_argument("--timeout", type=int, default=120,
                    help="per-mutant pytest timeout in seconds (default: 120)")
     p.add_argument("--output", "-o", default="mutest-report.html",
                    help="HTML report path (default: mutest-report.html)")
+    p.add_argument("--fail-under", type=_percentage, default=None, metavar="PERCENT",
+                   help="fail if the final mutation score is below this percentage "
+                        "(0-100); when set, timeout/error outcomes also fail")
     p.add_argument("--config", "-c", default=None, help="path to mutest.yaml")
     p.add_argument("--no-llm", action="store_true",
                    help="skip AI test generation even if --model is set")
@@ -89,6 +138,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print the score summary as JSON (for CI)")
     p.add_argument("--incremental", action="store_true",
                    help="only mutate files changed vs git HEAD")
+    p.add_argument("--base-ref", default=None,
+                   help="base git revision for --incremental (diffed as base...HEAD; "
+                        "local fallback remains HEAD when omitted)")
     p.add_argument("--gen-file", default="test_mutest_gen.py",
                    help="name of the generated-tests file (default: test_mutest_gen.py)")
     p.add_argument("--list-operators", action="store_true",
@@ -136,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 1. collect mutants
     if args.incremental:
-        changed = changed_files_since_git(src_dir)
+        changed = changed_files_since_git(src_dir, args.base_ref)
         if changed is None:
             print("warning: --incremental needs a git repo; falling back to all files",
                   file=sys.stderr)
@@ -185,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     by_id = {r.mutant.id: r for r in results}
     print(f"mutation score: {summary.score*100:.1f}% "
           f"({summary.killed} killed / {summary.survived} survived / "
+          f"{summary.timeout} timeout / {summary.error} error / "
           f"{summary.total} total, {summary.elapsed_s:.0f}s)")
 
     # 4. AI test generation loop
@@ -233,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                 rc, out = w.run_pytest(
                     timeout,
                     target=f"{w._tests_arg}/{args.gen_file}",
+                    sanitize_env=True,
                 )
             finally:
                 w.close()
@@ -246,8 +300,9 @@ def main(argv: list[str] | None = None) -> int:
                 print("re-running targeted mutants with generated tests...")
                 results2, _ = run_mutants(
                     [by_id[mid].mutant for _, _, mid in kept],
-                    src_dir, tests_dir, workers=workers, timeout=timeout)
-                newly_killed = sum(1 for r in results2 if r.status in (KILLED, TIMEOUT))
+                    src_dir, tests_dir, workers=workers, timeout=timeout,
+                    sanitize_env=True)
+                newly_killed = sum(1 for r in results2 if r.status == KILLED)
                 for r in results2:
                     by_id[r.mutant.id] = r
                 # recompute summary
@@ -256,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
                     generated_tests.append({
                         "name": name, "code": code,
                         "target": mid, "model": model,
-                        "status": "killed ✓" if r.status in (KILLED, TIMEOUT) else "still survived",
+                        "status": _generated_test_status(r.status),
                     })
                 gen_info = {
                     "delta": True,
@@ -275,12 +330,18 @@ def main(argv: list[str] | None = None) -> int:
     files_ctx = []
     per_file: dict[str, dict] = {}
     for r in by_id.values():
-        d = per_file.setdefault(r.mutant.file, {"total": 0, "killed": 0, "survived": 0})
+        d = per_file.setdefault(r.mutant.file, {
+            "total": 0, "killed": 0, "survived": 0, "timeout": 0, "error": 0,
+        })
         d["total"] += 1
-        if r.status in (KILLED, TIMEOUT):
+        if r.status == KILLED:
             d["killed"] += 1
         elif r.status == SURVIVED:
             d["survived"] += 1
+        elif r.status == TIMEOUT:
+            d["timeout"] += 1
+        else:
+            d["error"] += 1
     for name in sorted(per_file):
         d = per_file[name]
         denom = d["total"]
@@ -293,6 +354,14 @@ def main(argv: list[str] | None = None) -> int:
          "mutated_snippet": r.mutant.mutated_snippet}
         for r in by_id.values() if r.status == SURVIVED
     ]
+    unresolved_ms = [
+        {"id": r.mutant.id, "operator": r.mutant.operator,
+         "description": r.mutant.description,
+         "original_snippet": r.mutant.original_snippet,
+         "mutated_snippet": r.mutant.mutated_snippet,
+         "status": r.status, "detail": r.detail}
+        for r in by_id.values() if r.status in (TIMEOUT, ERROR)
+    ]
     ctx = {
         "target": f"{src_dir}  (+ {tests_dir})",
         "version": __version__,
@@ -300,17 +369,22 @@ def main(argv: list[str] | None = None) -> int:
         **summary.as_dict(),
         "files": files_ctx,
         "survived_mutants": survived_ms,
+        "unresolved_mutants": unresolved_ms,
         "generated_tests": generated_tests,
         **gen_info,
     }
     write_report(args.output, ctx)
     print(f"report written to {args.output}")
 
+    threshold_reasons = _threshold_failure_reasons(summary, args.fail_under)
+    if threshold_reasons:
+        print("FAIL: " + "; ".join(threshold_reasons), file=sys.stderr)
+
     if args.json:
         payload = {"version": __version__, **summary.as_dict(),
                    "output": args.output}
         print(json.dumps(payload))
-    return 0
+    return THRESHOLD_FAILURE if threshold_reasons else 0
 
 
 def _resummarize(results):
@@ -327,6 +401,17 @@ def _resummarize(results):
         else:
             s.error += 1
     return s
+
+
+def _generated_test_status(status: str) -> str:
+    """Return an honest status for a generated-test mutant re-run."""
+    if status == KILLED:
+        return "killed ✓"
+    if status == TIMEOUT:
+        return "timeout"
+    if status == ERROR:
+        return "error"
+    return "still survived"
 
 
 if __name__ == "__main__":

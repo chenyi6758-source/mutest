@@ -5,7 +5,7 @@
 
 **变异测试驱动的 AI 测试生成闭环 —— [qodo-cover](https://github.com/qodo-ai/qodo-cover)（2025 年 6 月已停止维护）的 MIT 协议继任者。**
 
-行覆盖率是个虚荣指标。`mutest` 往你的代码里注入微小的 bug（变异体），让你的测试套件逐个去抓，按抓获率打分：**变异分数 = 杀死数 / 总数**。没抓到的"幸存者"，让 LLM 针对性地写测试来补——再用*另一个*模型交叉验证，并且实打实跑一遍确认。
+行覆盖率是个虚荣指标。`mutest` 往你的代码里注入微小的 bug（变异体），让你的测试套件逐个去抓，按抓获率打分：**变异分数 = 杀死数 / 总数**。没抓到的"幸存者"，让 LLM 针对性地写测试来补——再用*另一个*模型交叉验证，并且实打实跑一遍确认。超时和执行错误会保留在总数中，并报告为未杀死。
 
 ## ⚡ 30 秒演示（真实输出）
 
@@ -38,15 +38,18 @@ report written to mutest-report.html
 ## 🚀 快速开始
 
 ```bash
-pip install mutest        # v0.1.0 将发布到 PyPI；目前：
+pip install mutest        # 只打分，安装保持轻量
+pip install "mutest[ai]"  # 使用 --model 时再安装可选的 litellm
+# v0.1.0 发布到 PyPI 前，也可以使用：
 pip install "mutest @ git+https://github.com/chenyi6758-source/mutest"
+pip install "mutest[ai] @ git+https://github.com/chenyi6758-source/mutest"
 
 cd your-python-project
 mutest --src src --tests tests --no-llm              # 只打分，不需要 API key
-mutest --src src --tests tests --model gpt-4o-mini   # + AI 测试生成闭环
+mutest --src src --tests tests --model gpt-4o-mini   # 需要先安装 mutest[ai]
 ```
 
-要求：Python 3.10+，`pytest` 套件本身是绿的（基线飘红时 mutest 会直接拒绝运行）。
+要求：Python 3.10+，`pytest` 套件本身是绿的（基线飘红时 mutest 会直接拒绝运行）。`litellm` 是可选依赖：只有使用 `--model` 或 `--verify-model` 时才需安装 `mutest[ai]`。
 
 加上 `--model` 后，mutest 会挑变异分数最低的幸存者，让 LLM 逐个写针对性测试，写入 `tests/test_mutest_gen.py`，然后**实证验证**：新测试必须在原始代码上通过、在变异体上失败。只有真杀死了变异体，分数才会涨。
 
@@ -54,7 +57,7 @@ mutest --src src --tests tests --model gpt-4o-mini   # + AI 测试生成闭环
 
 1. **变异** —— 10 个 AST 算子（AOR/ROR/LOR/NOT/NEGCOND/NUM/STR/RETNONE/RETBOOL/UNARY），每个变异点生成一个变异体。每个变异体都会重新 parse，无效代码和重复变异体自动丢弃。
 2. **处决** —— 每个变异体在隔离的临时工作区里跑完整 `pytest` 套件，并行执行（`-x`：第一次失败就停，我们只关心"抓没抓住"）。
-3. **生成** —— 对最顽固的幸存者，LLM 写针对性测试（`--model`，litellm 支持的都行；key 走标准环境变量，不落盘）。
+3. **生成** —— 对最顽固的幸存者，LLM 写针对性测试（`--model`，需安装 `mutest[ai]`；litellm 支持的都行；key 走标准环境变量，不落盘）。
 4. **交叉验证** —— 可选 `--verify-model`（换一个厂商的模型）评审生成的测试，再实跑确认：在原始代码上通过、在变异体上失败。
 5. **报告** —— 单文件 HTML：分数卡片、分文件明细、每个幸存者的原代码/变异代码 diff、生成的测试。
 
@@ -74,8 +77,10 @@ mutest --src src --tests tests --model gpt-4o-mini   # + AI 测试生成闭环
 --model gpt-4o-mini              生成测试用的 LLM（litellm 格式随便写）
 --verify-model claude-haiku-4-5  第二个模型交叉评审，打破"自己考自己"
 --top-n 10                       针对多少个幸存者生成测试
---workers 4 / --timeout 120
+--workers 4 / --timeout 120     （自动 worker 最多 8 个；显式值不受上限限制）
+--fail-under 75                 低于 75 个百分点时让 CI 失败
 --incremental                    只变异 git HEAD 改动过的文件（PR 场景）
+--base-ref BASE                   PR 基准版本；配合 --incremental 比较 BASE...HEAD
 --json                           输出 {"score": ...} 给 CI 用
 --config mutest.yaml             算子开关等（见 src/mutest/config.py）
 ```
@@ -85,11 +90,13 @@ mutest --src src --tests tests --model gpt-4o-mini   # + AI 测试生成闭环
 ## 🤖 GitHub Action
 
 ```yaml
-- uses: chenyi6758-source/mutest@v0.1.0
+- uses: chenyi6758-source/mutest@main  # 生产环境请固定到具体提交 SHA
   with:
     src: src
     tests: tests
+    # fail-under: "75"      # 设置后超时或执行错误也会失败
     incremental: "true"
+    base-ref: ${{ github.event.pull_request.base.sha }}
 ```
 
 详见 [`action.yml`](action.yml) 和 [`.github/workflows/mutest-example.yml`](.github/workflows/mutest-example.yml)（示例：在每个 PR 下自动评论变异分数）。
@@ -106,7 +113,7 @@ mutest --src src --tests tests --model gpt-4o-mini   # + AI 测试生成闭环
 用 `--incremental`（只跑改动的文件）、`--workers N`，或在 `mutest.yaml` 里关掉部分算子。变异测试本质是 O(变异体数 × 套件时间)，并行执行 + `-x` 提前退出已经把它压到实用区间。
 
 **生成的测试会联网吗？**
-不会。全本地运行；唯一的网络请求是你用 `--model` 时 litellm 直连你的模型厂商。key 只在你的环境变量里，不进仓库。
+生成的测试在本地执行，运行前会移除类似 secret、token、key、password 的环境变量，但这不是完整的网络沙箱。因此应把生成代码视为不可信代码，只在适当隔离的 CI 环境中运行。mutest 自身只有在你用 `--model` 时才会通过 litellm 直连模型厂商；key 不会写入仓库。
 
 ## 🗺️ 路线图
 

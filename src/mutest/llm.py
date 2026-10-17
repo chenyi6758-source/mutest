@@ -105,8 +105,7 @@ class LiteLLMProvider:
         except ImportError as e:
             raise RuntimeError(
                 "litellm is not installed. Install it with "
-                "`pip install mutest` (it is a declared dependency) or "
-                "`pip install litellm`."
+                "`pip install 'mutest[ai]'` or `pip install litellm`."
             ) from e
 
     def generate_test(

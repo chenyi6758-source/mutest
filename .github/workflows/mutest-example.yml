@@ -23,11 +23,13 @@ jobs:
 
       - name: Run mutest
         id: mutest
-        uses: chenyi6758-source/mutest@v0.1.0
+        uses: chenyi6758-source/mutest@main  # pin to a commit SHA in production
         with:
           src: src
           tests: tests
+          # fail-under: "75"  # threshold in percentage points; also fails on timeout/error
           incremental: "true"
+          base-ref: ${{ github.event.pull_request.base.sha }}
           # model: gpt-4o-mini   # uncomment + set OPENAI_API_KEY secret for AI loop
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
